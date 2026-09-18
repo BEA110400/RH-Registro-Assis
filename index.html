@@ -1422,6 +1422,24 @@ function atualizarStatusFeriasAutomatico(state){
     else novoStatus = 'Concluída';
     if(novoStatus !== f.status){ f.status = novoStatus; mudou = true; }
   });
+
+  // Avança o período aquisitivo (o "ciclo") sozinho quando ele já foi totalmente gozado/vendido — sem saldo
+  // restante — e não há nenhuma parcela ainda pendente (Programada/Em gozo) dentro dele. Cada registro de
+  // férias só pode "justificar" um avanço de ciclo uma única vez (marcado com _cicloConsumido) — sem isso,
+  // como o período de concessão de um ciclo se sobrepõe ao aquisitivo do ciclo seguinte, o mesmo registro
+  // acabava avançando o ciclo de novo a cada vez que o sistema era aberto.
+  state.colaboradores.filter(c=>c.status==='Ativo').forEach(c=>{
+    const calc = calcularFerias(state, c, hoje);
+    if(!calc) return;
+    const regsPeriodo = state.ferias.filter(f=>f.colaboradorId===c.id && f.status!=='Cancelada' && !f._cicloConsumido && f.dataSaida && parseD(f.dataSaida)>=calc.inicioAq && parseD(f.dataSaida)<=addDays(calc.fimAq,400));
+    const temPendente = regsPeriodo.some(f=>f.status==='Programada' || f.status==='Em gozo');
+    if(regsPeriodo.length>0 && !temPendente && calc.diasRestantes<=0.01){
+      c.cicloSemente = (Number(c.cicloSemente)||0) + 1;
+      regsPeriodo.forEach(f=>{ f._cicloConsumido = true; });
+      logAudit('edicao','colaborador', `Período aquisitivo de ${c.nome} avançou automaticamente — ciclo anterior totalmente gozado, sem parcelas pendentes.`);
+      mudou = true;
+    }
+  });
   return mudou;
 }
 
@@ -1647,27 +1665,46 @@ const RHU_DOC_LISTAS = ['colaboradores','ferias','ausencias','atestados','audito
 let DBH = null;                  // namespace do banco de dados (claude.use('db')), quando disponível
 let MODO_ARMAZENAMENTO = 'local'; // 'nuvem' | 'claude-legado' | 'local'
 let BACKUPS_CACHE = [];
+let ERRO_ARMAZENAMENTO = false;  // true = não foi possível confirmar a conexão com o banco de dados —
+                                  // nesse caso o app NUNCA salva nem reseta nada, só mostra um aviso.
+let ERRO_DETALHE = '';           // mensagem técnica exata do que falhou, mostrada na tela de erro.
 
 async function iniciarArmazenamento(){
+  // O claude.use('db') já espera internamente até ~10s por uma resposta, e chamá-lo de novo na MESMA
+  // página não tenta de novo de verdade (o resultado fica em cache/"memoizado") — só uma recarga
+  // completa da página consegue uma nova tentativa real. Por isso aqui é só uma chamada; quem decide
+  // se vale a pena recarregar a página automaticamente é o loadState()/boot() logo abaixo.
   try{
     if(typeof window!=='undefined' && window.claude && typeof window.claude.use==='function'){
       const db = await window.claude.use('db');
-      if(db){ DBH = db; MODO_ARMAZENAMENTO = 'nuvem'; return; }
+      if(db){ DBH = db; MODO_ARMAZENAMENTO = 'nuvem'; return true; }
+      ERRO_DETALHE = 'claude.use("db") retornou ' + db;
+    } else {
+      ERRO_DETALHE = 'window.claude ou window.claude.use não existem nesta página.';
     }
-  }catch(e){ /* segue para os modos de reserva abaixo */ }
-  if(typeof window!=='undefined' && window.storage && typeof window.storage.get==='function'){
-    MODO_ARMAZENAMENTO = 'claude-legado'; return;
+  }catch(e){ ERRO_DETALHE = 'Exceção em claude.use("db"): ' + (e && e.message || e); }
+  return false;
+}
+
+// Lê um documento com pequenas tentativas extras — leituras em sequência rápida (vários documentos, um
+// atrás do outro, como fazemos aqui) podem esbarrar num limite de taxa da própria capability; isso não
+// significa "não existe", então vale tentar de novo antes de desistir.
+async function dbGetComRetentativa(caminho){
+  let ultimoErro;
+  for(let i=0;i<3;i++){
+    try{ return await DBH.doc(caminho).get(); }
+    catch(e){ ultimoErro = e; await new Promise(r=>setTimeout(r, 400*(i+1))); }
   }
-  MODO_ARMAZENAMENTO = 'local';
+  throw ultimoErro;
 }
 
 async function dbLerTudo(){
   if(MODO_ARMAZENAMENTO==='nuvem'){
-    const nucleoSnap = await DBH.doc('rhu/nucleo').get();
+    const nucleoSnap = await dbGetComRetentativa('rhu/nucleo');
     if(!nucleoSnap.exists) return null;
     const out = {...nucleoSnap.data()};
     for(const nome of RHU_DOC_LISTAS){
-      const snap = await DBH.doc('rhu/'+nome).get();
+      const snap = await dbGetComRetentativa('rhu/'+nome);
       out[nome] = snap.exists ? (snap.data().itens||[]) : [];
     }
     return out;
@@ -1702,16 +1739,35 @@ async function dbSalvarTudo(){
 }
 
 async function loadState(){
-  await iniciarArmazenamento();
+  const conectou = await iniciarArmazenamento();
+  if(!conectou || MODO_ARMAZENAMENTO!=='nuvem'){
+    // Não foi possível confirmar a conexão com o banco de dados compartilhado depois de várias
+    // tentativas. NUNCA inventamos dados nem salvamos nada nesse caso — era exatamente isso que causava
+    // perda de dados: o app caía num modo local vazio, mostrava a base de exemplo por cima dos dados
+    // reais, e qualquer coisa cadastrada ali não ia para lugar nenhum confiável (sumia no próximo acesso).
+    ERRO_ARMAZENAMENTO = true;
+    S = JSON.parse(JSON.stringify(BACKUP_INICIAL));
+    migrateState();
+    return;
+  }
   try{
     const carregado = await dbLerTudo();
-    if(carregado){ S = carregado; migrateState(); await persist(true); await verificarBackupDiario(); return; }
-  }catch(e){ console.error('Falha ao carregar dados', e); }
-  // Usa o backup real do usuário (dados já cadastrados) como base, em vez dos dados sintéticos de demonstração.
-  S = JSON.parse(JSON.stringify(BACKUP_INICIAL));
-  migrateState();
-  await persist(true);
-  await verificarBackupDiario();
+    if(carregado){ S = JSON.parse(JSON.stringify(carregado)); migrateState(); await persist(true); await verificarBackupDiario(); return; }
+    // Só chega aqui se o banco respondeu normalmente e confirmou que ainda não existe nada salvo —
+    // ou seja, é mesmo a primeira vez que o sistema é usado.
+    S = JSON.parse(JSON.stringify(BACKUP_INICIAL));
+    migrateState();
+    await persist(true);
+    await verificarBackupDiario();
+  }catch(e){
+    // O banco existe e está conectado, mas a leitura falhou por algum motivo pontual. Isso NÃO significa
+    // "não existe nada" — nunca sobrescreve nesse caso, só trava a tela com um aviso claro.
+    console.error('Falha ao carregar dados', e);
+    ERRO_DETALHE = 'Falha ao ler os dados: ' + (e && e.message || e);
+    ERRO_ARMAZENAMENTO = true;
+    S = JSON.parse(JSON.stringify(BACKUP_INICIAL));
+    migrateState();
+  }
 }
 
 // ---- Backup automático diário ----
@@ -1898,11 +1954,26 @@ function migrateState(){
 async function persist(immediate){
   clearTimeout(SAVE_TIMER);
   const doSave = async ()=>{
-    try{ await dbSalvarTudo(); }
-    catch(e){ console.error('Falha ao salvar', e); toast('Não foi possível salvar — tente novamente.', 'danger'); }
+    try{ await dbSalvarTudo(); indicarSalvo(); }
+    catch(e){ console.error('Falha ao salvar', e); toast('Não foi possível salvar — verifique sua conexão e tente de novo. Nada foi perdido na tela.', 'danger'); }
   };
   if(immediate) return doSave();
   SAVE_TIMER = setTimeout(doSave, 300);
+}
+
+// Indicador discreto de que a última alteração foi mesmo gravada no banco de dados persistente
+// (não aparece se estiver salvando só localmente, já que aí não haveria garantia nenhuma).
+let SALVO_INDICADOR_TIMER = null;
+function indicarSalvo(){
+  if(MODO_ARMAZENAMENTO!=='nuvem') return;
+  let ind = q('#indicador-salvo');
+  if(!ind){
+    ind = el(`<div id="indicador-salvo" style="position:fixed;bottom:20px;left:20px;background:var(--success-bg);color:var(--success);padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,0.12);z-index:998;opacity:0;transition:opacity .25s;pointer-events:none;">✓ Dados salvos</div>`);
+    document.body.appendChild(ind);
+  }
+  clearTimeout(SALVO_INDICADOR_TIMER);
+  ind.style.opacity = '1';
+  SALVO_INDICADOR_TIMER = setTimeout(()=>{ ind.style.opacity = '0'; }, 1800);
 }
 
 function logAudit(tipo, entidade, descricao){
@@ -2765,7 +2836,7 @@ function viewFeriasPeriodos(){
 
   return `
   <div class="section-head"><div><h2>Períodos aquisitivos</h2><div class="section-desc">Réplica dos campos da planilha original — recalcula sozinho a cada acesso, a partir da data de hoje</div></div></div>
-  <div class="banner info">Os campos de <strong>dias de direito, situação e limite</strong> são recalculados automaticamente todo dia. O <strong>ciclo de referência</strong> (colunas "Início/Fim do período aquisitivo") só avança quando o RH confirma que um ciclo foi totalmente gozado — ajuste em Colaboradores → "Ciclos de férias já quitados", exatamente como a planilha exigia atualizar a SEMENTE na aba Motor.</div>
+  <div class="banner info">Os campos de <strong>dias de direito, situação e limite</strong> são recalculados automaticamente todo dia. O <strong>ciclo de referência</strong> (colunas "Início/Fim do período aquisitivo") agora também avança sozinho, assim que o período é totalmente gozado/vendido e não há mais nenhuma parcela pendente. Você ainda pode ajustar manualmente em Colaboradores → "Ciclos de férias já quitados", se precisar corrigir algo.</div>
   <div class="filters-bar">
     <div class="field"><label>Setor</label><select onchange="PERIODOS_FILTER.setor=this.value;renderContentOnly()"><option value="">Todos</option>${S.setores.map(s=>`<option value="${s.id}" ${PERIODOS_FILTER.setor===s.id?'selected':''}>${esc(s.nome)}</option>`).join('')}</select></div>
     <div class="field"><label>Situação</label><select onchange="PERIODOS_FILTER.situacao=this.value;renderContentOnly()"><option value="">Todas</option>${situacoes.map(s=>`<option ${PERIODOS_FILTER.situacao===s?'selected':''}>${s}</option>`).join('')}</select></div>
@@ -3024,6 +3095,7 @@ function salvarFerias(id){
     S.ferias.push(novo);
     logAudit('criacao','ferias', `Programou férias para ${colabNome(novo.colaboradorId)}`);
   }
+  atualizarStatusFeriasAutomatico(S);
   persist(); closeModal(); render(); toast('Programação salva.');
 }
 function excluirFerias(id){
@@ -4534,8 +4606,29 @@ function render(){
 
 async function boot(){
   const root = q('#root');
+  const tentativasAnteriores = Number(sessionStorage.getItem('_rhuConnRetry')||'0');
   root.innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--ink);color:#fff;font-family:'Poppins',sans-serif;font-size:15px;">Carregando RH Registro Assis…</div>`;
   await loadState();
+  if(ERRO_ARMAZENAMENTO){
+    if(tentativasAnteriores < 2){
+      // Recarrega a página sozinho (a conexão só tem uma chance real de funcionar de novo numa página
+      // nova) antes de incomodar o usuário com qualquer aviso.
+      sessionStorage.setItem('_rhuConnRetry', String(tentativasAnteriores+1));
+      setTimeout(()=>location.reload(), 1200);
+      return;
+    }
+    root.innerHTML = `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--ink);color:#fff;font-family:'Poppins',sans-serif;padding:20px;">
+      <div style="max-width:440px;text-align:center;">
+        <div style="font-size:32px;margin-bottom:12px;">⚠</div>
+        <div style="font-size:16px;font-weight:600;margin-bottom:10px;">Não foi possível conectar ao banco de dados</div>
+        <div style="font-size:13.5px;color:#c8d0e0;line-height:1.5;margin-bottom:14px;">Já tentamos algumas vezes sozinhos. Para sua segurança, nada foi exibido, alterado ou apagado. Recarregue a página — se continuar acontecendo depois de algumas tentativas, avise antes de cadastrar qualquer coisa.</div>
+        ${ERRO_DETALHE? `<div style="font-size:11px;color:#8891a5;font-family:monospace;background:rgba(0,0,0,0.25);padding:8px 10px;border-radius:4px;margin-bottom:18px;text-align:left;word-break:break-word;">${esc(ERRO_DETALHE)}</div>` : ''}
+        <button class="btn btn-primary" onclick="sessionStorage.removeItem('_rhuConnRetry');location.reload()">Tentar novamente</button>
+      </div>
+    </div>`;
+    return;
+  }
+  sessionStorage.removeItem('_rhuConnRetry');
   if(MODO_ARMAZENAMENTO==='nuvem' && BACKUPS_CACHE.length===0){ BACKUPS_CACHE = await listarBackupsAutomaticos(); }
   // Login removido a pedido: entra direto com o usuário de gestão (não há mais tela de e-mail/senha).
   CUR = S.usuarios[0];
